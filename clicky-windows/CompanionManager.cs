@@ -1,3 +1,5 @@
+using System.Windows;
+
 namespace Clicky;
 
 // ── Voice state machine ───────────────────────────────────────────────────────
@@ -15,13 +17,17 @@ public enum VoiceState
 public record PermissionsSnapshot(bool HasMicrophoneAccess, bool HasScreenCaptureAccess);
 
 /// <summary>
-/// Central state machine.  Owns the dictation pipeline, push-to-talk shortcut monitor,
-/// screen capture, Claude API client, ElevenLabs TTS, and overlay management.
-/// Mirrors CompanionManager.swift in responsibility.
+/// Central state machine.  Owns the full push-to-talk → screenshot → Claude → TTS → pointing
+/// pipeline.  Mirrors CompanionManager.swift.
 ///
-/// Chunk 2 adds the real audio engine, AssemblyAI provider, overlay window, and pointing.
-/// This shell wires up the event surface so the UI (CompanionPanelWindow) can bind
-/// to it immediately.
+/// Collaborator responsibilities:
+/// - GlobalPushToTalkShortcutMonitor: detects Ctrl+Alt key events system-wide
+/// - AudioCaptureEngine: microphone capture + PCM16 conversion
+/// - AssemblyAiStreamingTranscriptionProvider: streams audio to AssemblyAI, delivers transcript
+/// - ScreenCaptureUtility: captures all monitors as JPEG
+/// - ClaudeApiClient: SSE streaming chat with vision
+/// - ElevenLabsTtsClient: TTS playback
+/// - OverlayWindow: blue cursor, response text, spinner, pointing animation
 /// </summary>
 public sealed class CompanionManager : IDisposable
 {
@@ -37,24 +43,34 @@ public sealed class CompanionManager : IDisposable
     private string _currentClaudeModel = AppConfig.DefaultClaudeModel;
     private bool _isCursorOverlayVisible = true;
 
-    // Conversation history sent to Claude on every turn
     private readonly List<ConversationMessage> _conversationHistory = new();
 
-    // ── Collaborators (wired up fully in Chunk 2) ─────────────────────────────
+    // ── Collaborators ─────────────────────────────────────────────────────────
 
     private readonly ClaudeApiClient _claudeApiClient = new();
     private readonly ElevenLabsTtsClient _ttsClient = new();
+    private readonly AudioCaptureEngine _audioCaptureEngine = new();
+    private readonly AssemblyAiStreamingTranscriptionProvider _transcriptionProvider = new();
+    private readonly GlobalPushToTalkShortcutMonitor _pushToTalkMonitor = new();
+
+    // Created lazily on the WPF dispatcher when first needed
+    private OverlayWindow? _overlayWindow;
+
     private CancellationTokenSource? _activeTurnCancellationSource;
 
     // ── Startup ───────────────────────────────────────────────────────────────
 
     public async Task StartAsync()
     {
-        // Chunk 2: start hotkey monitor, audio engine, AssemblyAI provider
-        await Task.CompletedTask;
+        WireAudioCaptureEvents();
+        WireTranscriptionProviderEvents();
+        WirePushToTalkMonitorEvents();
 
-        // Emit initial permissions state so the panel dots render correctly on first open
-        RaisePermissionsChanged();
+        _pushToTalkMonitor.Start();
+
+        _ttsClient.PlaybackStopped += OnTtsPlaybackStopped;
+
+        await CheckAndReportPermissions();
     }
 
     // ── Public API called by UI ───────────────────────────────────────────────
@@ -67,32 +83,128 @@ public sealed class CompanionManager : IDisposable
     public void SetCursorOverlayVisible(bool isVisible)
     {
         _isCursorOverlayVisible = isVisible;
-        // Chunk 2: show/hide the overlay window
+
+        if (!isVisible)
+        {
+            System.Windows.Application.Current.Dispatcher.Invoke(() =>
+                _overlayWindow?.Hide());
+        }
     }
 
-    // ── Push-to-talk entry points (called by GlobalPushToTalkShortcutMonitor) ─
+    // ── Push-to-talk lifecycle ────────────────────────────────────────────────
 
-    /// <summary>
-    /// Called when the push-to-talk hotkey is pressed.  Transitions to Listening state
-    /// and begins microphone capture + streaming transcription.
-    /// </summary>
-    public void OnPushToTalkPressed()
+    private void OnPushToTalkPressed(object? sender, EventArgs eventArgs)
     {
         if (_currentVoiceState != VoiceState.Idle) return;
 
         TransitionToVoiceState(VoiceState.Listening);
-        // Chunk 2: start audio capture and AssemblyAI session
+
+        System.Windows.Application.Current.Dispatcher.Invoke(() =>
+        {
+            EnsureOverlayWindowCreated();
+
+            if (_isCursorOverlayVisible)
+                _overlayWindow!.ShowOverlay(isTransientMode: false);
+            else
+                _overlayWindow!.ShowOverlay(isTransientMode: true);
+
+            _overlayWindow!.ShowCursorAtCurrentMousePosition();
+            _overlayWindow!.ClearResponseText();
+        });
+
+        _audioCaptureEngine.StartCapture();
+
+        // Start the AssemblyAI session asynchronously — fire-and-forget; errors are handled inside
+        _ = StartTranscriptionSessionAsync();
     }
 
-    /// <summary>
-    /// Called when the push-to-talk hotkey is released.  Finalizes the transcript,
-    /// captures a screenshot, and kicks off the Claude → TTS pipeline.
-    /// </summary>
-    public async void OnPushToTalkReleased(string finalizedTranscript)
+    private void OnPushToTalkReleased(object? sender, EventArgs eventArgs)
     {
         if (_currentVoiceState != VoiceState.Listening) return;
 
+        // Stop mic capture; finalize the AssemblyAI turn
+        _audioCaptureEngine.StopCapture();
+
         TransitionToVoiceState(VoiceState.Processing);
+
+        System.Windows.Application.Current.Dispatcher.Invoke(() =>
+        {
+            _overlayWindow?.HideSpinner();
+            _overlayWindow?.ShowSpinner();
+        });
+
+        // The transcription provider will raise TranscriptFinalized once AssemblyAI
+        // delivers the session_termination message.  We signal end-of-turn here.
+        _ = FinalizeTranscriptionSessionAsync();
+    }
+
+    private async Task StartTranscriptionSessionAsync()
+    {
+        try
+        {
+            await _transcriptionProvider.StartSessionAsync();
+        }
+        catch (Exception)
+        {
+            // Token fetch or WebSocket connection failed — return to idle
+            TransitionToVoiceState(VoiceState.Idle);
+        }
+    }
+
+    private async Task FinalizeTranscriptionSessionAsync()
+    {
+        try
+        {
+            await _transcriptionProvider.FinalizeCurrentTurnAsync();
+        }
+        catch (Exception)
+        {
+            TransitionToVoiceState(VoiceState.Idle);
+        }
+    }
+
+    // ── Transcription provider events ─────────────────────────────────────────
+
+    private void OnTranscriptFinalized(object? sender, string finalizedTranscript)
+    {
+        // Fired on a background thread by the WebSocket receive loop
+        _ = RunConversationTurnAsync(finalizedTranscript);
+    }
+
+    private void OnTranscriptPartialUpdate(object? sender, string partialTranscript)
+    {
+        // Show live transcript in the overlay bubble while the user is still speaking
+        System.Windows.Application.Current.Dispatcher.Invoke(() =>
+        {
+            _overlayWindow?.ClearResponseText();
+            _overlayWindow?.AppendResponseToken(partialTranscript);
+        });
+    }
+
+    // ── Audio capture events ──────────────────────────────────────────────────
+
+    private void OnAudioChunkAvailable(object? sender, AudioChunkEventArgs audioChunkEventArgs)
+    {
+        // Fire-and-forget; errors logged inside provider
+        _ = _transcriptionProvider.SendAudioChunkAsync(audioChunkEventArgs.Pcm16Data);
+    }
+
+    private void OnAudioLevelUpdated(object? sender, float normalizedAudioLevel)
+    {
+        AudioLevelChanged?.Invoke(this, normalizedAudioLevel);
+    }
+
+    // ── Conversation turn pipeline ────────────────────────────────────────────
+
+    private async Task RunConversationTurnAsync(string userTranscript)
+    {
+        if (string.IsNullOrWhiteSpace(userTranscript))
+        {
+            TransitionToVoiceState(VoiceState.Idle);
+            return;
+        }
+
+        _conversationHistory.Add(new ConversationMessage("user", userTranscript));
 
         _activeTurnCancellationSource?.Cancel();
         _activeTurnCancellationSource = new CancellationTokenSource();
@@ -100,55 +212,111 @@ public sealed class CompanionManager : IDisposable
 
         try
         {
-            await RunConversationTurnAsync(finalizedTranscript, cancellationToken);
+            // Capture all screens now, just before calling Claude
+            var screenCaptures = ScreenCaptureUtility.CaptureAllMonitors();
+
+            System.Windows.Application.Current.Dispatcher.Invoke(() =>
+            {
+                _overlayWindow?.HideSpinner();
+                _overlayWindow?.ClearResponseText();
+            });
+
+            TransitionToVoiceState(VoiceState.Responding);
+
+            var fullResponseBuilder = new System.Text.StringBuilder();
+
+            await foreach (var token in _claudeApiClient.StreamResponseAsync(
+                _conversationHistory, screenCaptures, _currentClaudeModel, cancellationToken))
+            {
+                fullResponseBuilder.Append(token);
+
+                // Stream visible text (without tag syntax) to the overlay bubble
+                var displayText = PointingTagParser.StripPointingTags(fullResponseBuilder.ToString());
+                System.Windows.Application.Current.Dispatcher.Invoke(() =>
+                {
+                    _overlayWindow?.ClearResponseText();
+                    _overlayWindow?.AppendResponseToken(displayText);
+                });
+            }
+
+            var completeResponseText = fullResponseBuilder.ToString();
+            _conversationHistory.Add(new ConversationMessage("assistant", completeResponseText));
+
+            // Animate cursor to each pointing target Claude embedded in its response
+            var pointingTargets = PointingTagParser.ExtractPointingTargets(completeResponseText);
+            foreach (var pointingTarget in pointingTargets)
+            {
+                if (cancellationToken.IsCancellationRequested) break;
+                await System.Windows.Application.Current.Dispatcher.InvokeAsync(async () =>
+                {
+                    if (_overlayWindow != null)
+                        await _overlayWindow.AnimateCursorToPointingTargetAsync(pointingTarget, cancellationToken);
+                });
+            }
+
+            // Speak the clean response text (tags stripped) via ElevenLabs
+            var textToSpeak = PointingTagParser.StripPointingTags(completeResponseText);
+            await _ttsClient.SpeakAsync(textToSpeak, cancellationToken);
         }
         catch (OperationCanceledException)
         {
-            // User interrupted — return to idle without clearing history
+            // Interrupted — do not clear history; user may interrupt and ask again
         }
         catch (Exception)
         {
-            // Network/API error — return to idle, do not crash
+            // Network / API error — surface nothing to the user; just return to idle
         }
         finally
         {
-            TransitionToVoiceState(VoiceState.Idle);
+            // TTS completion triggers the state transition via OnTtsPlaybackStopped;
+            // if TTS was skipped (empty response or error), transition here.
+            if (!_ttsClient.IsPlaying)
+                TransitionToVoiceState(VoiceState.Idle);
         }
     }
 
-    // ── Conversation turn pipeline ────────────────────────────────────────────
-
-    private async Task RunConversationTurnAsync(
-        string userTranscript,
-        CancellationToken cancellationToken)
+    private void OnTtsPlaybackStopped(object? sender, EventArgs eventArgs)
     {
-        // Add user turn to history
-        _conversationHistory.Add(new ConversationMessage("user", userTranscript));
-
-        // Chunk 2: capture screenshots here
-        var screenCaptures = new List<ScreenCapture>();
-
-        // Stream Claude's response token by token
-        var fullResponseText = new System.Text.StringBuilder();
-
-        TransitionToVoiceState(VoiceState.Responding);
-
-        await foreach (var token in _claudeApiClient.StreamResponseAsync(
-            _conversationHistory, screenCaptures, _currentClaudeModel, cancellationToken))
+        System.Windows.Application.Current.Dispatcher.Invoke(() =>
         {
-            fullResponseText.Append(token);
-            // Chunk 2: push token to overlay window for display
-        }
+            _overlayWindow?.ScheduleTransientFadeOut();
+        });
 
-        var completeResponseText = fullResponseText.ToString();
+        TransitionToVoiceState(VoiceState.Idle);
+    }
 
-        // Add assistant turn to history
-        _conversationHistory.Add(new ConversationMessage("assistant", completeResponseText));
+    // ── Permissions check ─────────────────────────────────────────────────────
 
-        // Chunk 2: parse [POINT:x,y:label:screenN] tags and animate cursor
+    private async Task CheckAndReportPermissions()
+    {
+        // Microphone: attempt to open and immediately close the default capture device
+        bool hasMicrophoneAccess = await CheckMicrophoneAccessAsync();
 
-        // Speak the response via ElevenLabs
-        await _ttsClient.SpeakAsync(completeResponseText, cancellationToken);
+        // Screen capture: on Windows there is no explicit per-app permission prompt for
+        // GDI CopyFromScreen — access is controlled at the OS/group policy level.
+        // We assume access is available and catch exceptions during actual capture.
+        bool hasScreenCaptureAccess = true;
+
+        PermissionsChanged?.Invoke(this,
+            new PermissionsSnapshot(hasMicrophoneAccess, hasScreenCaptureAccess));
+    }
+
+    private static async Task<bool> CheckMicrophoneAccessAsync()
+    {
+        return await Task.Run(() =>
+        {
+            try
+            {
+                using var testCapture = new NAudio.Wave.WaveInEvent();
+                testCapture.StartRecording();
+                testCapture.StopRecording();
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        });
     }
 
     // ── State transitions ─────────────────────────────────────────────────────
@@ -159,23 +327,55 @@ public sealed class CompanionManager : IDisposable
         VoiceStateChanged?.Invoke(this, newVoiceState);
     }
 
-    private void RaisePermissionsChanged()
-    {
-        // Chunk 2: check actual microphone and screen capture permissions via Windows APIs
-        var permissionsSnapshot = new PermissionsSnapshot(
-            HasMicrophoneAccess: false,
-            HasScreenCaptureAccess: false);
+    // ── Event wiring helpers ──────────────────────────────────────────────────
 
-        PermissionsChanged?.Invoke(this, permissionsSnapshot);
+    private void WireAudioCaptureEvents()
+    {
+        _audioCaptureEngine.AudioChunkAvailable += OnAudioChunkAvailable;
+        _audioCaptureEngine.AudioLevelUpdated += OnAudioLevelUpdated;
+    }
+
+    private void WireTranscriptionProviderEvents()
+    {
+        _transcriptionProvider.TranscriptFinalized += OnTranscriptFinalized;
+        _transcriptionProvider.TranscriptPartialUpdate += OnTranscriptPartialUpdate;
+    }
+
+    private void WirePushToTalkMonitorEvents()
+    {
+        _pushToTalkMonitor.PushToTalkPressed += OnPushToTalkPressed;
+        _pushToTalkMonitor.PushToTalkReleased += OnPushToTalkReleased;
+    }
+
+    // ── Overlay window factory ────────────────────────────────────────────────
+
+    private void EnsureOverlayWindowCreated()
+    {
+        // Must be called on the WPF dispatcher
+        if (_overlayWindow == null || !_overlayWindow.IsLoaded)
+        {
+            _overlayWindow = new OverlayWindow();
+        }
     }
 
     // ── Cleanup ───────────────────────────────────────────────────────────────
 
     public void Dispose()
     {
+        _pushToTalkMonitor.PushToTalkPressed -= OnPushToTalkPressed;
+        _pushToTalkMonitor.PushToTalkReleased -= OnPushToTalkReleased;
+        _pushToTalkMonitor.Stop();
+        _pushToTalkMonitor.Dispose();
+
         _activeTurnCancellationSource?.Cancel();
         _activeTurnCancellationSource?.Dispose();
+
+        _audioCaptureEngine.Dispose();
+        _transcriptionProvider.Dispose();
         _claudeApiClient.Dispose();
         _ttsClient.Dispose();
+
+        System.Windows.Application.Current.Dispatcher.Invoke(() =>
+            _overlayWindow?.Close());
     }
 }
