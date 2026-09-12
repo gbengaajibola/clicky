@@ -90,6 +90,29 @@ open leanring-buddy.xcodeproj
 
 **Do NOT run `xcodebuild` from the terminal** — it invalidates TCC (Transparency, Consent, and Control) permissions and the app will need to re-request screen recording, accessibility, etc.
 
+## Windows Build & Run
+
+```bash
+# Prerequisites: .NET 8 SDK, Visual Studio 2022 (or VS Code + C# extension)
+
+cd clicky-windows
+
+# Restore packages
+dotnet restore
+
+# Build (requires Windows — WPF targets are Windows-only)
+dotnet build
+
+# Run
+dotnet run
+
+# Run tests (self-contained; no audio device or live API needed)
+dotnet test Tests/Clicky.Tests.csproj
+```
+
+**Environment variable**: Set `CLICKY_WORKER_URL` to your deployed Cloudflare Worker URL before running.  
+**Push-to-talk hotkey**: Ctrl + Alt (equivalent of macOS ctrl+option).
+
 ## Cloudflare Worker
 
 ```bash

@@ -1,0 +1,107 @@
+<Window x:Class="Clicky.OverlayWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="ClickyOverlay"
+        WindowStyle="None"
+        AllowsTransparency="True"
+        Background="Transparent"
+        ShowInTaskbar="False"
+        Topmost="True"
+        IsHitTestVisible="False"
+        ResizeMode="NoResize">
+
+  <!-- Full-screen transparent canvas; all overlay elements are positioned absolutely -->
+  <Canvas Name="OverlayCanvas">
+
+    <!-- Blue cursor body — a filled circle with a white highlight dot -->
+    <Canvas Name="CursorCanvas"
+            Width="48" Height="48"
+            Visibility="Collapsed">
+
+      <!-- Outer glow ring -->
+      <Ellipse Width="48" Height="48"
+               Fill="#402979FC">
+        <Ellipse.Effect>
+          <BlurEffect Radius="8" />
+        </Ellipse.Effect>
+      </Ellipse>
+
+      <!-- Main blue circle -->
+      <Ellipse Width="36" Height="36"
+               Fill="#FF3B82F6"
+               Canvas.Left="6" Canvas.Top="6">
+        <Ellipse.Effect>
+          <DropShadowEffect Color="#FF1D4ED8"
+                            BlurRadius="8"
+                            ShadowDepth="2"
+                            Opacity="0.6" />
+        </Ellipse.Effect>
+      </Ellipse>
+
+      <!-- White specular highlight -->
+      <Ellipse Width="10" Height="10"
+               Fill="White"
+               Opacity="0.8"
+               Canvas.Left="14" Canvas.Top="10" />
+    </Canvas>
+
+    <!-- Response text bubble — appears beside the cursor -->
+    <Border Name="ResponseBubble"
+            Background="#E0121214"
+            CornerRadius="12"
+            Padding="14,10"
+            MaxWidth="400"
+            Visibility="Collapsed">
+      <Border.Effect>
+        <DropShadowEffect Color="#FF000000"
+                          BlurRadius="16"
+                          ShadowDepth="4"
+                          Opacity="0.5" />
+      </Border.Effect>
+
+      <StackPanel>
+        <TextBlock Name="ResponseTextBlock"
+                   Foreground="#FFF2F2F7"
+                   FontSize="14"
+                   TextWrapping="Wrap"
+                   MaxWidth="372" />
+
+        <!-- Pointing label shown while cursor is animating to a target -->
+        <TextBlock Name="PointingLabelTextBlock"
+                   Foreground="#FF8E8E93"
+                   FontSize="11"
+                   Margin="0,4,0,0"
+                   Visibility="Collapsed" />
+      </StackPanel>
+    </Border>
+
+    <!-- Spinner shown during Claude processing -->
+    <Canvas Name="SpinnerCanvas"
+            Width="32" Height="32"
+            Visibility="Collapsed">
+      <Ellipse Width="32" Height="32"
+               Stroke="#FF3B82F6"
+               StrokeThickness="3"
+               StrokeDashArray="6,6">
+        <Ellipse.RenderTransform>
+          <RotateTransform x:Name="SpinnerRotateTransform"
+                           CenterX="16" CenterY="16" />
+        </Ellipse.RenderTransform>
+        <Ellipse.Triggers>
+          <EventTrigger RoutedEvent="Loaded">
+            <BeginStoryboard>
+              <Storyboard RepeatBehavior="Forever">
+                <DoubleAnimation
+                  Storyboard.TargetName="SpinnerRotateTransform"
+                  Storyboard.TargetProperty="Angle"
+                  From="0" To="360"
+                  Duration="0:0:1" />
+              </Storyboard>
+            </BeginStoryboard>
+          </EventTrigger>
+        </Ellipse.Triggers>
+      </Ellipse>
+    </Canvas>
+
+  </Canvas>
+</Window>
